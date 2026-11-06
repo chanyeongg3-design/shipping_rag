@@ -1,0 +1,88 @@
+# 로컬 개발·시연용. 모든 서비스가 같은 네트워크에서 서비스 이름으로 서로를 찾는다.
+#
+#   docker compose up -d qdrant redis        # 뼈대 단계: 인프라만
+#   docker compose up -d --build             # 전체: qdrant + redis + api
+#   docker compose --profile tools run --rm cli index   # 배치 CLI(인덱싱·평가) 실행
+#   docker compose down                      # 중지(데이터 볼륨은 유지) / down -v 는 데이터까지 삭제
+#
+# 전제: .env 파일(.env.example을 복사), api·cli는 루트 pyproject.toml/uv.lock 과 app/ 이 있어야 빌드된다.
+
+name: rag-qa
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest   # 팀이 버전을 정하면 고정한다 (색인 호환성)
+    ports:
+      - "6333:6333"   # REST
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage   # 이 볼륨이 인덱스 원본. 없으면 컨테이너를 지울 때 인덱스도 사라진다
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # 세션과 캐시가 같은 Redis를 쓴다. maxmemory 초과 시 TTL이 있는 키만 지우므로 모든 키에 TTL을 둔다.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "volatile-lru"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  api:   # FastAPI 앱 = app/api.py 가 백엔드·검색·청킹(임베더) 모듈을 조립한 컨테이너
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file: .env
+    environment:
+      # .env 의 localhost 주소를 컨테이너 네트워크 주소로 덮어쓴다
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379/0
+      RAG_MODEL_CACHE: /models
+    ports:
+      - "8000:8000"
+    volumes:
+      - model_cache:/models   # 임베딩 모델(E5 등)을 한 번만 내려받는다
+    depends_on:
+      qdrant:
+        condition: service_started   # 앱은 시작 시 Qdrant 연결을 재시도해야 한다 (/health 가 index_ready 로 준비 여부를 알린다)
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s   # 모델 로딩 시간
+    restart: unless-stopped
+
+  cli:   # 배치 CLI(인덱싱·평가). 평소에는 뜨지 않고 `--profile tools run` 으로만 실행한다
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["python", "-m", "app.cli"]
+    env_file: .env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379/0
+      RAG_MODEL_CACHE: /models
+      DOCUMENTS_DIR: /data/documents
+      EVALUATION_DIR: /data/evaluation
+    volumes:
+      - ./data:/data:ro   # 원본 PDF·평가 JSON (저장소에 커밋하지 않는다). 읽기 전용
+      - model_cache:/models
+    depends_on:
+      - qdrant
+      - redis
+
+volumes:
+  qdrant_data:
+  redis_data:
+  model_cache:
